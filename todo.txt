@@ -1,0 +1,53 @@
+Currently
+- Add logging and maybe wrap in lightning so explicit control fo model progress
+-  Fix following issues
+1. splitmnist_label_accuracy indexes the wrong position.
+pythonlogits = outputs["logits"][:, -2, label_slice]
+The sequence is [pixel_1...pixel_784, SEP, LABEL]. The LABEL token is at position -1, so the prediction for it comes from the logits at position -2 (predicting the next token from position 784+1 = SEP). This is actually correct for a causal LM. But collect_sep_representations also uses hidden_states[:, -2, :] and calls it the "SEP position". That's the SEP token's hidden state, not wrong per se, but the comments say "representation the model uses to predict the class token" — that's accurate. This is fine, but the naming is slightly misleading since the SEP and "prediction position" are conflated in the comments.
+2. old_domain_eval_data and new_domain_eval_data are the same object.
+In make_tasks_and_probes:
+pythonold_domain_eval_data=bundle.eval_loader,
+new_domain_eval_data=bundle.eval_loader,
+Both point to the same loader. This means the tester computes old-domain NLL and new-domain NLL on identical data for every task, which is meaningless — NLL on the current task's own eval loader isn't a retention metric, it's just task performance restated as NLL. The old-domain eval data should be the previous tasks' loaders, and new-domain should be the current task's. As written, these fields generate numbers that look legitimate in the report but measure nothing useful.
+3. The seen_task_names in StageContext is off-by-one.
+pythonseen_task_names = task_names[:task_idx]
+task_idx is 1-indexed (from enumerate(tasks, start=1)), so after training task 0 you get task_names[:1] which includes task_names[0] — the task just trained. But the stage is constructed after training, so seen_task_names should include the just-trained task. That's actually correct. However, the representation probe explicitly skips unseen tasks with if not ctx.seen_task_names, meaning after training task 0 the probe runs — fine. But the probe only runs centroids for ctx.seen_task_names which doesn't include the task just trained in the initial stage (where seen_task_names=[]). This is fine for stage 0 specifically (is_initial=True), but worth being aware the representation probe lags by one stage for the first task.
+4. IdentityCompressedTokenizer patches at the module level but only when model_name == "engram".
+pythonengram_module.CompressedTokenizer = _PatchedIdentityTokenizer
+This monkey-patches the class globally. If you instantiate multiple models in the same process (e.g. --num-runs > 1) and one is engram and another isn't, the patch persists and the second run's non-Engram path won't be affected — but if you ever run two Engram models with different vocab sizes in the same process, the second patch silently overwrites the first. This is fragile. The correct fix is to pass the tokenizer as a dependency to EngramMemoryModule rather than patching a global.
+5. Support and probe indices can overlap.
+pythonsupport_indices = take_per_class_indices(..., seed=seed + exp_idx)
+probe_indices = take_per_class_indices(..., seed=seed + 1000 + exp_idx)
+The two index sets are drawn independently from the same dataset with different seeds, but there's no guarantee they don't overlap (they'll often have significant overlap for small datasets). For a nearest-centroid probe this means you're evaluating on data the centroid was built from, which inflates the probe score. You need to explicitly exclude support_indices when drawing probe_indices.
+6. compute_old_domain_nll runs on all tasks at every stage, including future tasks.
+pythonfor task in tasks:  # ALL tasks, not just seen ones
+    if task.old_domain_eval_data is None:
+        continue
+    nll_val = model.nll(task.old_domain_eval_data)
+This means at stage 1 (after training task 1), you compute NLL on tasks 3, 4, 5 that the model has never seen. That's not retention NLL, it's just OOD evaluation. It'll produce valid numbers but under the "old_domain_nll" label it's semantically wrong for future tasks. You probably want for task in tasks_to_eval instead.
+7. math.exp(nll_val) will overflow for large NLL values.
+Early in training, NLL can be large (5–10+ for a random model on 10 classes). math.exp(10) is fine, but math.exp(50) returns inf and that propagates into your report silently. Wrap it: math.exp(min(nll_val, 88.0)) or use numpy.exp which returns inf more gracefully and doesn't throw.
+8. aggregate_reports in main() just prints the dataclass, not JSON.
+pythonprint(aggregate_reports(reports))
+AggregatedReport doesn't have a to_dict() method or __str__, so this prints a raw dataclass repr. The single-run path calls to_dict() properly. The multi-run path should probably do json.dumps(asdict(aggregate_reports(reports)), indent=2).
+
+- After fixing bugs run the code -splitmnist_experiment.py and see if its running as expected with the baseline and then the engram (dont test other models yet)
+
+Later
+- add ReducedAttentionTransformer + Engram and MLPOnly + Engram
+- use splitmnist data
+- build
+
+
+RUN
+
+python trace_experiment.py \
+  --trace-root /Users/parinarora/Ashoka/Sheffield/proj_exp/Engram_test/TRACE_DATA/extracted/TRACE-Benchmark/LLM-CL-Benchmark_1000 \
+  --task-order C-STANCE,FOMC,MeetingBank,Py150,ScienceQA,NumGLUE-cm,NumGLUE-ds,20Minuten \
+  --model baseline \
+  --tokenizer-name gpt2 \
+  --epochs 1 \
+  --batch-size 8 \
+  --eval-batch-size 8 \
+  --device mps \
+  --save-json trace_report.json

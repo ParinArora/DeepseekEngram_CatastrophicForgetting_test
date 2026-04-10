@@ -1,0 +1,10 @@
+numpy
+sympy
+torch
+torchvision
+transformers
+tokenizers
+avalanche-lib
+sentencepiece
+lightning
+tensorboard

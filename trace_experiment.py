@@ -22,6 +22,7 @@ import os
 import random
 import re
 import string
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -67,9 +68,213 @@ from tester import (
     aggregate_reports,
 )
 
+try:
+    from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
+except Exception:
+    CSVLogger = None
+    TensorBoardLogger = None
+
 logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
+
+
+class TraceLightningExperimentLogger:
+    """Optional Lightning-style experiment logger for TRACE runs."""
+
+    def __init__(
+        self,
+        enabled: bool,
+        save_dir: str,
+        name: str,
+        version: Optional[str] = None,
+    ) -> None:
+        self.enabled = enabled
+        self.save_dir = save_dir
+        self.name = name
+        self.version = version
+        self.loggers: List[Any] = []
+        self.metrics_path: Optional[Path] = None
+
+        if not self.enabled:
+            return
+
+        log_root = Path(save_dir)
+        log_root.mkdir(parents=True, exist_ok=True)
+
+        if CSVLogger is not None:
+            self.loggers.append(CSVLogger(save_dir=save_dir, name=name, version=version))
+        if TensorBoardLogger is not None:
+            self.loggers.append(TensorBoardLogger(save_dir=save_dir, name=name, version=version))
+
+        run_dir = log_root / name
+        if version:
+            run_dir = run_dir / version
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_path = run_dir / "trace_metrics.jsonl"
+
+        if self.loggers:
+            logger.info(
+                "Enabled Lightning experiment logging: save_dir=%s name=%s version=%s backends=%s",
+                save_dir,
+                name,
+                version if version is not None else "auto",
+                ",".join(type(x).__name__ for x in self.loggers),
+            )
+        else:
+            logger.info(
+                "Lightning logging requested, but lightning loggers are unavailable; falling back to JSONL logging at %s",
+                self.metrics_path,
+            )
+
+    def log_hyperparams(self, params: Dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+
+        clean = self._sanitize_dict(params)
+        for exp_logger in self.loggers:
+            try:
+                exp_logger.log_hyperparams(clean)
+            except Exception:
+                logger.exception("Failed to log hyperparameters with %s", type(exp_logger).__name__)
+
+        self._append_jsonl({"type": "hyperparams", "payload": clean})
+
+    def log_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
+        if not self.enabled:
+            return
+
+        clean = self._sanitize_dict(metrics)
+        numeric_metrics = {k: v for k, v in clean.items() if isinstance(v, (int, float))}
+        if step is not None:
+            numeric_metrics.setdefault("step", step)
+
+        for exp_logger in self.loggers:
+            try:
+                exp_logger.log_metrics(numeric_metrics, step=step)
+            except Exception:
+                logger.exception("Failed to log metrics with %s", type(exp_logger).__name__)
+
+        payload = {"type": "metrics", "payload": clean}
+        if step is not None:
+            payload["step"] = step
+        self._append_jsonl(payload)
+
+    def finalize(self, status: str = "success") -> None:
+        if not self.enabled:
+            return
+
+        self._append_jsonl({"type": "finalize", "status": status})
+        for exp_logger in self.loggers:
+            finalize = getattr(exp_logger, "finalize", None)
+            if callable(finalize):
+                try:
+                    finalize(status)
+                except Exception:
+                    logger.exception("Failed to finalize %s", type(exp_logger).__name__)
+
+    def _append_jsonl(self, record: Dict[str, Any]) -> None:
+        if self.metrics_path is None:
+            return
+        with self.metrics_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(self._sanitize_dict(record)) + "\n")
+
+    def _sanitize_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for key, value in data.items():
+            if isinstance(value, dict):
+                nested = self._sanitize_dict(value)
+                for nested_key, nested_value in nested.items():
+                    out[f"{key}/{nested_key}"] = nested_value
+            elif isinstance(value, (list, tuple)):
+                out[key] = json.dumps([self._sanitize_value(x) for x in value])
+            else:
+                out[key] = self._sanitize_value(value)
+        return out
+
+    def _sanitize_value(self, value: Any) -> Any:
+        if value is None:
+            return "None"
+        if isinstance(value, (str, bool, int, float)):
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if hasattr(value, "item"):
+            try:
+                return value.item()
+            except Exception:
+                return str(value)
+        return str(value)
+
+
+def build_experiment_tracker(args, seed: int) -> TraceLightningExperimentLogger:
+    # This wrapper keeps the existing experiment flow intact while making it
+    # easy to mirror runs into Lightning-compatible loggers.
+    experiment_name = args.lightning_experiment_name or f"trace_{args.model}"
+    version = f"seed_{seed}"
+    return TraceLightningExperimentLogger(
+        enabled=args.enable_lightning_logging,
+        save_dir=args.lightning_log_dir,
+        name=experiment_name,
+        version=version,
+    )
+
+
+def summarize_report_metrics(report) -> Dict[str, Any]:
+    # Flatten the final report into logger-friendly scalars so each run is easy
+    # to compare in TensorBoard/CSV outputs.
+    metrics: Dict[str, Any] = {}
+
+    summary = report.summary
+    metrics["summary/final_acc"] = summary.final_acc
+    metrics["summary/mean_forgetting"] = summary.mean_forgetting
+    metrics["summary/worst_forgetting"] = summary.worst_forgetting
+    metrics["summary/bwt"] = summary.bwt
+    metrics["summary/fwt"] = summary.fwt
+    metrics["summary/intransigence"] = summary.intransigence
+
+    for task_name, value in summary.per_task_final.items():
+        metrics[f"summary/per_task_final/{task_name}"] = value
+    for task_name, value in summary.per_task_best.items():
+        metrics[f"summary/per_task_best/{task_name}"] = value
+    for task_name, value in summary.per_task_forgetting.items():
+        metrics[f"summary/per_task_forgetting/{task_name}"] = value
+    for task_name, value in summary.immediate_new_task_scores.items():
+        metrics[f"summary/immediate_new_task_scores/{task_name}"] = value
+
+    for stage in report.stages:
+        stage_prefix = f"stage_{stage.stage_idx}"
+        if stage.trained_task_name is not None:
+            metrics[f"{stage_prefix}/trained_task"] = stage.trained_task_name
+        for task_name, value in stage.task_scores.items():
+            metrics[f"{stage_prefix}/task_scores/{task_name}"] = value
+        for metric_name, value in stage.old_domain_nll.items():
+            metrics[f"{stage_prefix}/old_domain_nll/{metric_name}"] = value
+        for metric_name, value in stage.old_domain_ppl.items():
+            metrics[f"{stage_prefix}/old_domain_ppl/{metric_name}"] = value
+        for metric_name, value in stage.new_domain_nll.items():
+            metrics[f"{stage_prefix}/new_domain_nll/{metric_name}"] = value
+        for metric_name, value in stage.new_domain_ppl.items():
+            metrics[f"{stage_prefix}/new_domain_ppl/{metric_name}"] = value
+        for probe_name, probe_metrics in stage.general_probes.items():
+            for metric_name, value in probe_metrics.items():
+                metrics[f"{stage_prefix}/general_probes/{probe_name}/{metric_name}"] = value
+        for probe_name, probe_metrics in stage.memory_probes.items():
+            for metric_name, value in probe_metrics.items():
+                metrics[f"{stage_prefix}/memory_probes/{probe_name}/{metric_name}"] = value
+        for probe_name, probe_metrics in stage.representation_probes.items():
+            for metric_name, value in probe_metrics.items():
+                metrics[f"{stage_prefix}/representation_probes/{probe_name}/{metric_name}"] = value
+        if stage.resources.train_time_sec is not None:
+            metrics[f"{stage_prefix}/resources/train_time_sec"] = stage.resources.train_time_sec
+        if stage.resources.eval_time_sec is not None:
+            metrics[f"{stage_prefix}/resources/eval_time_sec"] = stage.resources.eval_time_sec
+        if stage.resources.train_units_per_sec is not None:
+            metrics[f"{stage_prefix}/resources/train_units_per_sec"] = stage.resources.train_units_per_sec
+        if stage.resources.eval_units_per_sec is not None:
+            metrics[f"{stage_prefix}/resources/eval_units_per_sec"] = stage.resources.eval_units_per_sec
+
+    return metrics
 
 
 # =============================================================================
@@ -712,6 +917,11 @@ def run_one(args, seed: int):
     # whole setup into the shared continual-learning tester.
     set_seed(seed)
 
+    tracker = build_experiment_tracker(args, seed=seed)
+    run_started = time.perf_counter()
+
+    logger.info("Starting TRACE run | seed=%d | model=%s | trace_root=%s", seed, args.model, args.trace_root)
+
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is not None:
@@ -731,6 +941,45 @@ def run_one(args, seed: int):
     )
 
     tasks, general_suites, memory_suites, repr_suites = make_tasks_and_probes(args, tokenizer)
+
+    logger.info(
+        "Prepared TRACE run | num_tasks=%d | task_order=%s | vocab_size=%d | device=%s",
+        len(tasks),
+        ",".join(task.name for task in tasks),
+        len(tokenizer),
+        args.device,
+    )
+
+    tracker.log_hyperparams({
+        "dataset": "TRACE",
+        "trace_root": args.trace_root,
+        "model": args.model,
+        "seed": seed,
+        "tokenizer_name": args.tokenizer_name,
+        "device": args.device,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "eval_batch_size": args.eval_batch_size,
+        "num_workers": args.num_workers,
+        "lr": args.lr,
+        "max_seq_len": args.max_seq_len,
+        "max_new_tokens": args.max_new_tokens,
+        "log_every": args.log_every,
+        "num_tasks": len(tasks),
+        "task_order": [task.name for task in tasks],
+        "enable_lightning_logging": args.enable_lightning_logging,
+    })
+
+    for task_idx, task in enumerate(tasks):
+        logger.info(
+            "Task %d/%d | name=%s | train_size=%s | eval_size=%s | task_dir=%s",
+            task_idx + 1,
+            len(tasks),
+            task.name,
+            task.metadata.get("train_size"),
+            task.metadata.get("eval_size"),
+            task.metadata.get("task_dir"),
+        )
 
     # FWT is only computed if explicit baselines are provided. For now we set
     # them to 0.0 as a simple placeholder.
@@ -757,15 +1006,36 @@ def run_one(args, seed: int):
         )
     )
 
-    return tester.run(
-        model=adapter,
-        tasks=tasks,
-        general_probe_suites=general_suites,
-        memory_probe_suites=memory_suites,
-        representation_probe_suites=repr_suites,
-        future_task_baselines=future_task_baselines,
-        oracle_new_task_scores=oracle_new_task_scores,
+    try:
+        report = tester.run(
+            model=adapter,
+            tasks=tasks,
+            general_probe_suites=general_suites,
+            memory_probe_suites=memory_suites,
+            representation_probe_suites=repr_suites,
+            future_task_baselines=future_task_baselines,
+            oracle_new_task_scores=oracle_new_task_scores,
+        )
+    except Exception:
+        tracker.finalize(status="failed")
+        logger.exception("TRACE run failed | seed=%d | model=%s", seed, args.model)
+        raise
+
+    elapsed = time.perf_counter() - run_started
+    tracker.log_metrics(summarize_report_metrics(report), step=len(report.stages))
+    tracker.log_metrics({"run/total_time_sec": elapsed}, step=len(report.stages))
+    tracker.finalize(status="success")
+
+    logger.info(
+        "Finished TRACE run | seed=%d | stages=%d | final_acc=%s | mean_forgetting=%s | total_time_sec=%.2f",
+        seed,
+        len(report.stages),
+        report.summary.final_acc,
+        report.summary.mean_forgetting,
+        elapsed,
     )
+
+    return report
 
 
 # =============================================================================
@@ -795,6 +1065,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--save-json", type=str, default="")
+    parser.add_argument("--enable-lightning-logging", action="store_true",
+                        help="Mirror run metadata/metrics to Lightning-compatible loggers when available")
+    parser.add_argument("--lightning-log-dir", type=str, default="lightning_logs",
+                        help="Directory used for Lightning-style experiment logs")
+    parser.add_argument("--lightning-experiment-name", type=str, default="",
+                        help="Optional override for the Lightning experiment name")
     return parser.parse_args()
 
 
